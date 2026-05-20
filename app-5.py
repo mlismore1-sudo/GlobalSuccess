@@ -1,467 +1,385 @@
-import base64
-import json
+import os
+import re
 import time
-from collections import deque
+import math
+import json
+import sqlite3
 from datetime import date, datetime
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Companies House International Screening", layout="wide")
+st.set_page_config(page_title="Companies House New Incorporations Screener", layout="wide")
 
 BASE_URL = "https://api.company-information.service.gov.uk"
-DATA_DIR = Path("data")
-REVIEWED_FILE = DATA_DIR / "reviewed_companies.json"
-RESULTS_FILE = DATA_DIR / "results_history.csv"
-
-TARGET_SIC_CODES = {
+DB_PATH = "companies_house_screening.db"
+ALLOWED_SIC_CODES = [
     "62012", "62020", "63120", "47910", "46190", "46499", "70229", "73110", "74909", "68209",
     "64209", "68100", "32990", "10890", "86900", "93130", "96040", "82990", "72110", "56101",
+]
+COUNTRY_TERMS = {
+    "usa", "united states", "united states of america", "america", "france", "germany", "belgium",
+    "norway", "sweden", "finland", "denmark", "austria", "poland", "spain", "portugal", "greece",
+    "italy", "hungary", "croatia", "ireland", "china", "netherlands", "india", "hong kong",
+    "hong-kong", "singapore",
 }
-
-ALLOWED_COMPANY_TYPES = {"ltd", "llp"}
-ALLOWED_OFFICER_ROLES = {"director", "llp member"}
-
-TARGET_DIRECTOR_COUNTRIES = {
-    "usa", "united states of america", "america", "france", "germany", "belgium", "norway", "sweden",
-    "finland", "denmark", "austria", "poland", "spain", "portugal", "greece", "italy", "hungary",
-    "croatia", "ireland", "china", "netherlands", "india", "hong kong", "singapore",
+NATIONALITY_TERMS = {
+    "american", "us", "u.s.", "u.s.a.", "united states", "united states of america", "french", "german",
+    "belgian", "norwegian", "swedish", "finnish", "danish", "austrian", "polish", "spanish", "portuguese",
+    "greek", "italian", "hungarian", "croatian", "irish", "chinese", "indian", "hong kong", "hong-kong",
+    "hongkong", "singaporean", "dutch", "netherlands",
 }
-
-TARGET_PSC_NATIONALITIES = {
-    "american", "usa", "us", "french", "german", "belgian", "norwegian", "swedish", "finnish",
-    "danish", "austrian", "polish", "spanish", "portuguese", "greek", "italian", "hungarian",
-    "croatian", "irish", "chinese", "dutch", "indian", "hong konger", "hong kong chinese", "singaporean",
-}
-
-PSC_CORPORATE_KINDS = {
-    "corporate entity person with significant control",
-    "corporate entity beneficial owner",
-    "legal person person with significant control",
-    "legal person beneficial owner",
-    "super secure person with significant control",
-    "super secure beneficial owner",
+COMPANY_OWNER_KINDS = {
+    "corporate-entity-person-with-significant-control",
+    "legal-person-person-with-significant-control",
+    "super-secure-person-with-significant-control",
 }
 
 
-def ensure_storage() -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    if not REVIEWED_FILE.exists():
-        REVIEWED_FILE.write_text("{}", encoding="utf-8")
-    if not RESULTS_FILE.exists():
-        pd.DataFrame(columns=[
-            "screened_at",
-            "search_date",
-            "company_number",
-            "company_name",
-            "sic_code",
-            "international_director",
-            "international_shareholder",
-            "owned_by_a_company",
-        ]).to_csv(RESULTS_FILE, index=False)
-
-
-def normalize_text(value: Optional[str]) -> str:
+def normalize_text(value: Any) -> str:
     if value is None:
         return ""
     text = str(value).strip().lower()
-    for ch in [",", ".", ";", ":", "(", ")", "[", "]", "{", "}", "'", '"']:
-        text = text.replace(ch, " ")
     text = text.replace("-", " ")
-    return " ".join(text.split())
+    text = re.sub(r"[^a-z0-9\s]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    aliases = {
+        "usa": "united states",
+        "u s a": "united states",
+        "u s": "us",
+        "united states of america": "united states",
+        "america": "american",
+        "hong kong": "hong kong",
+        "the netherlands": "netherlands",
+    }
+    return aliases.get(text, text)
 
 
-def load_api_keys() -> List[str]:
-    keys: List[str] = []
-    try:
-        raw = st.secrets.get("COMPANIES_HOUSE_API_KEYS", [])
-        if isinstance(raw, list):
-            keys.extend([str(x).strip() for x in raw if str(x).strip()])
-        elif isinstance(raw, str) and raw.strip():
-            keys.append(raw.strip())
-    except Exception:
-        pass
-    return keys
+def matches_country_or_nationality(value: Any, lookup: set) -> bool:
+    norm = normalize_text(value)
+    if not norm:
+        return False
+    return norm in lookup
 
 
-class CompaniesHouseClient:
+class CHClient:
     def __init__(self, api_keys: List[str]):
-        self.api_keys = [k for k in api_keys if k]
+        self.api_keys = [k.strip() for k in api_keys if str(k).strip()]
         if not self.api_keys:
-            raise ValueError("No API keys found. Add COMPANIES_HOUSE_API_KEYS to .streamlit/secrets.toml")
+            raise ValueError("No Companies House API keys supplied.")
+        self.idx = 0
         self.session = requests.Session()
-        self.key_queue = deque(self.api_keys)
 
-    def _auth_header(self, api_key: str) -> Dict[str, str]:
-        token = base64.b64encode(f"{api_key}:".encode("utf-8")).decode("utf-8")
-        return {"Authorization": f"Basic {token}"}
+    def _auth(self) -> Tuple[str, str]:
+        key = self.api_keys[self.idx % len(self.api_keys)]
+        return (key, "")
 
-    def get(self, path: str, params: Optional[Dict] = None, timeout: int = 30) -> requests.Response:
-        attempts = 0
-        last_response = None
-        while attempts < max(3, len(self.api_keys) * 2):
-            api_key = self.key_queue[0]
-            self.key_queue.rotate(-1)
+    def _rotate(self):
+        self.idx = (self.idx + 1) % len(self.api_keys)
+
+    def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        last_error = None
+        for _ in range(len(self.api_keys) * 2):
             try:
                 response = self.session.get(
                     f"{BASE_URL}{path}",
                     params=params,
-                    headers=self._auth_header(api_key),
-                    timeout=timeout,
+                    auth=self._auth(),
+                    timeout=30,
+                    headers={"Accept": "application/json"},
                 )
-                last_response = response
-                if response.status_code == 429:
-                    attempts += 1
-                    time.sleep(0.5)
+                if response.status_code == 404:
+                    return {}
+                if response.status_code in (401, 403, 429):
+                    last_error = f"HTTP {response.status_code}"
+                    self._rotate()
+                    time.sleep(0.4)
                     continue
-                return response
-            except requests.RequestException:
-                attempts += 1
-                time.sleep(0.5)
-        if last_response is not None:
-            return last_response
-        raise requests.RequestException("All API requests failed")
+                response.raise_for_status()
+                return response.json()
+            except requests.RequestException as exc:
+                last_error = str(exc)
+                self._rotate()
+                time.sleep(0.4)
+        raise RuntimeError(f"Companies House API request failed after retries: {last_error}")
 
 
-def load_reviewed() -> Dict[str, dict]:
-    ensure_storage()
-    try:
-        return json.loads(REVIEWED_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def save_reviewed(reviewed: Dict[str, dict]) -> None:
-    REVIEWED_FILE.write_text(json.dumps(reviewed, indent=2), encoding="utf-8")
-
-
-def load_results() -> pd.DataFrame:
-    ensure_storage()
-    try:
-        return pd.read_csv(RESULTS_FILE)
-    except Exception:
-        return pd.DataFrame(columns=[
-            "screened_at", "search_date", "company_number", "company_name", "sic_code",
-            "international_director", "international_shareholder", "owned_by_a_company"
-        ])
-
-
-def save_results(df: pd.DataFrame) -> None:
-    df.to_csv(RESULTS_FILE, index=False)
-
-
-def fetch_companies_for_date(client: CompaniesHouseClient, target_date: str) -> List[dict]:
-    companies: List[dict] = []
-    start_index = 0
-    page_size = 200
-    while True:
-        params = {
-            "incorporated_from": target_date,
-            "incorporated_to": target_date,
-            "company_status": "active",
-            "company_type": "ltd,llp",
-            "sic_codes": ",".join(sorted(TARGET_SIC_CODES)),
-            "size": page_size,
-            "start_index": start_index,
-        }
-        resp = client.get("/advanced-search/companies", params=params)
-        if resp.status_code == 404:
-            break
-        resp.raise_for_status()
-        payload = resp.json()
-        items = payload.get("items", [])
-        if not items:
-            break
-        companies.extend(items)
-        if len(items) < page_size:
-            break
-        start_index += page_size
-        time.sleep(0.1)
-    return companies
-
-
-def extract_target_sic(item: dict) -> str:
-    codes = item.get("sic_codes") or []
-    if isinstance(codes, str):
-        codes = [c.strip() for c in codes.split(",") if c.strip()]
-    for code in codes:
-        if str(code) in TARGET_SIC_CODES:
-            return str(code)
-    return str(codes[0]) if codes else ""
-
-
-def is_active_officer(officer: dict) -> bool:
-    return not officer.get("resigned_on")
-
-
-def officer_role_matches(officer: dict) -> bool:
-    return normalize_text(officer.get("officer_role")) in ALLOWED_OFFICER_ROLES
-
-
-def has_international_director(client: CompaniesHouseClient, company_number: str) -> bool:
-    start_index = 0
-    while True:
-        resp = client.get(f"/company/{company_number}/officers", params={"items_per_page": 100, "start_index": start_index})
-        if resp.status_code in (404, 400):
-            return False
-        resp.raise_for_status()
-        payload = resp.json()
-        items = payload.get("items", [])
-        if not items:
-            return False
-        for officer in items:
-            if not is_active_officer(officer):
-                continue
-            if not officer_role_matches(officer):
-                continue
-            cor = normalize_text(officer.get("country_of_residence"))
-            if cor in TARGET_DIRECTOR_COUNTRIES:
-                return True
-        if len(items) < 100:
-            return False
-        start_index += 100
-        time.sleep(0.05)
-
-
-def has_psc_nationality_match(psc: dict) -> bool:
-    nationality = normalize_text(psc.get("nationality"))
-    return nationality in TARGET_PSC_NATIONALITIES
-
-
-def is_corporate_psc(psc: dict) -> bool:
-    kind = normalize_text(psc.get("kind"))
-    return kind in PSC_CORPORATE_KINDS
-
-
-def psc_is_ceased(psc: dict) -> bool:
-    return bool(psc.get("ceased_on"))
-
-
-def get_psc_flags(client: CompaniesHouseClient, company_number: str) -> Tuple[bool, bool]:
-    start_index = 0
-    shareholder_match = False
-    corporate_owner = False
-    while True:
-        resp = client.get(
-            f"/company/{company_number}/persons-with-significant-control",
-            params={"items_per_page": 100, "start_index": start_index, "register_view": "true"},
+def init_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS screened_companies (
+            company_number TEXT PRIMARY KEY,
+            company_name TEXT,
+            sic_code TEXT,
+            incorporation_date TEXT,
+            company_type TEXT,
+            international_director INTEGER,
+            international_shareholder INTEGER,
+            owned_by_company INTEGER,
+            pulled_at TEXT,
+            raw_json TEXT
         )
-        if resp.status_code in (404, 400):
-            return shareholder_match, corporate_owner
-        resp.raise_for_status()
-        payload = resp.json()
-        items = payload.get("items", [])
-        if not items:
-            return shareholder_match, corporate_owner
-        for psc in items:
-            if psc_is_ceased(psc):
-                continue
-            if has_psc_nationality_match(psc):
-                shareholder_match = True
-            if is_corporate_psc(psc):
-                corporate_owner = True
-        if len(items) < 100:
-            return shareholder_match, corporate_owner
-        start_index += 100
-        time.sleep(0.05)
+        """
+    )
+    conn.commit()
+    return conn
 
 
-def screen_new_companies(client: CompaniesHouseClient, target_date: str, progress_bar=None, status_box=None):
-    reviewed = load_reviewed()
-    results_df = load_results()
-    raw_companies = fetch_companies_for_date(client, target_date)
-    candidates: List[dict] = []
-    for item in raw_companies:
-        company_number = str(item.get("company_number", "")).strip()
-        if not company_number:
-            continue
-        if reviewed.get(company_number):
-            continue
-        company_type = normalize_text(item.get("company_type"))
-        if company_type not in ALLOWED_COMPANY_TYPES:
-            continue
-        sic_code = extract_target_sic(item)
-        if sic_code not in TARGET_SIC_CODES:
-            continue
-        candidates.append(item)
+def existing_company_numbers(conn: sqlite3.Connection, incorporation_date: str) -> set:
+    rows = conn.execute(
+        "SELECT company_number FROM screened_companies WHERE incorporation_date = ?",
+        (incorporation_date,),
+    ).fetchall()
+    return {r[0] for r in rows}
 
-    new_rows = []
-    total_candidates = len(candidates)
-    if progress_bar is not None:
-        progress_bar.progress(0, text=f"Starting screening for {total_candidates} company(ies)...")
-    if status_box is not None:
-        status_box.info(f"Preparing to screen {total_candidates} new company(ies).")
 
-    for idx, item in enumerate(candidates, start=1):
-        company_number = str(item.get("company_number", "")).strip()
-        company_name = item.get("company_name") or item.get("title") or ""
-        sic_code = extract_target_sic(item)
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def upsert_company(conn: sqlite3.Connection, row: Dict[str, Any]) -> None:
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO screened_companies (
+            company_number, company_name, sic_code, incorporation_date, company_type,
+            international_director, international_shareholder, owned_by_company, pulled_at, raw_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            row["company_number"], row["company_name"], row["sic_code"], row["incorporation_date"], row["company_type"],
+            int(row["international_director"]), int(row["international_shareholder"]), int(row["owned_by_company"]),
+            row["pulled_at"], json.dumps(row.get("raw_json", {})),
+        ),
+    )
+    conn.commit()
 
-        if status_box is not None:
-            status_box.info(f"Screening {idx}/{total_candidates}: {company_name} ({company_number})")
 
-        director_flag = has_international_director(client, company_number)
-        shareholder_flag, company_owner_flag = get_psc_flags(client, company_number)
-        row = {
-            "screened_at": ts,
-            "search_date": target_date,
-            "company_number": company_number,
-            "company_name": company_name,
-            "sic_code": sic_code,
-            "international_director": "✓" if director_flag else "",
-            "international_shareholder": "✓" if shareholder_flag else "",
-            "owned_by_a_company": "✓" if company_owner_flag else "",
-        }
-        new_rows.append(row)
-        reviewed[company_number] = {"search_date": target_date, "screened_at": ts}
-
-        if progress_bar is not None and total_candidates > 0:
-            progress_bar.progress(idx / total_candidates, text=f"Processed {idx} of {total_candidates} companies")
-
-    save_reviewed(reviewed)
-
-    if new_rows:
-        new_df = pd.DataFrame(new_rows)
-        results_df = pd.concat([new_df, results_df], ignore_index=True)
-        results_df = results_df.sort_values("screened_at", ascending=False, kind="stable").reset_index(drop=True)
-        save_results(results_df)
+def read_results(conn: sqlite3.Connection, incorporation_date: Optional[str] = None) -> pd.DataFrame:
+    if incorporation_date:
+        query = "SELECT * FROM screened_companies WHERE incorporation_date = ? ORDER BY pulled_at DESC"
+        df = pd.read_sql_query(query, conn, params=(incorporation_date,))
     else:
-        new_df = pd.DataFrame(columns=[
-            "screened_at", "search_date", "company_number", "company_name", "sic_code",
-            "international_director", "international_shareholder", "owned_by_a_company"
-        ])
-
-    filtered_new_df = new_df[
-        (new_df["international_director"] == "✓") |
-        (new_df["international_shareholder"] == "✓") |
-        (new_df["owned_by_a_company"] == "✓")
-    ].copy()
-
-    filtered_all_df = results_df[
-        (results_df["international_director"] == "✓") |
-        (results_df["international_shareholder"] == "✓") |
-        (results_df["owned_by_a_company"] == "✓")
-    ].copy()
-
-    display_new = filtered_new_df[[
-        "company_name", "sic_code", "international_director", "international_shareholder", "owned_by_a_company"
-    ]].rename(columns={
-        "company_name": "Company Name",
-        "sic_code": "SIC Code",
-        "international_director": "International Director?",
-        "international_shareholder": "International Shareholder?",
-        "owned_by_a_company": "Owned By A Company?",
-    })
-
-    display_all = filtered_all_df[[
-        "company_name", "sic_code", "international_director", "international_shareholder", "owned_by_a_company", "screened_at"
-    ]].rename(columns={
-        "company_name": "Company Name",
-        "sic_code": "SIC Code",
-        "international_director": "International Director?",
-        "international_shareholder": "International Shareholder?",
-        "owned_by_a_company": "Owned By A Company?",
-        "screened_at": "Pulled At",
-    })
-    if progress_bar is not None:
-        progress_bar.progress(1.0, text="Screening complete")
-    if status_box is not None:
-        status_box.success(f"Finished screening {len(candidates)} new company(ies).")
-    return display_new, len(raw_companies), len(candidates), display_all
-
-
-def reset_storage() -> None:
-    if REVIEWED_FILE.exists():
-        REVIEWED_FILE.unlink()
-    if RESULTS_FILE.exists():
-        RESULTS_FILE.unlink()
-    ensure_storage()
-
-
-def build_display_all() -> pd.DataFrame:
-    all_results_df = load_results()
-    if all_results_df.empty:
+        query = "SELECT * FROM screened_companies ORDER BY pulled_at DESC"
+        df = pd.read_sql_query(query, conn)
+    if df.empty:
         return pd.DataFrame(columns=[
-            "Company Name", "SIC Code", "International Director?", "International Shareholder?",
-            "Owned By A Company?", "Pulled At"
+            "Company Name", "SIC Code", "International Director?", "International Shareholder?", "Owned By A Company?", "Pulled At"
         ])
-    filtered_all_df = all_results_df[
-        (all_results_df["international_director"] == "✓") |
-        (all_results_df["international_shareholder"] == "✓") |
-        (all_results_df["owned_by_a_company"] == "✓")
-    ].copy()
-    return filtered_all_df[[
-        "company_name", "sic_code", "international_director", "international_shareholder", "owned_by_a_company", "screened_at"
-    ]].rename(columns={
-        "company_name": "Company Name",
-        "sic_code": "SIC Code",
-        "international_director": "International Director?",
-        "international_shareholder": "International Shareholder?",
-        "owned_by_a_company": "Owned By A Company?",
-        "screened_at": "Pulled At",
+    display = pd.DataFrame({
+        "Company Name": df["company_name"],
+        "SIC Code": df["sic_code"],
+        "International Director?": df["international_director"].map(lambda x: "✓" if int(x) else ""),
+        "International Shareholder?": df["international_shareholder"].map(lambda x: "✓" if int(x) else ""),
+        "Owned By A Company?": df["owned_by_company"].map(lambda x: "✓" if int(x) else ""),
+        "Pulled At": df["pulled_at"],
     })
+    return display
 
 
-def main() -> None:
-    ensure_storage()
-    st.title("Companies House International Screening")
-    st.caption("Single-file Streamlit app for daily Companies House screening using rotating API keys.")
+def get_company_type_candidates() -> List[str]:
+    return [
+        "ltd",
+        "private-limited-guarant-nsc",
+        "private-limited-shares-section-30-exemption",
+        "llp",
+    ]
 
-    with st.sidebar:
-        st.header("Search settings")
-        target_date = st.date_input("Incorporation date", value=date.today(), format="YYYY-MM-DD")
-        run_scan = st.button("Run scan", type="primary", use_container_width=True)
-        reset_btn = st.button("Reset reviewed history", use_container_width=True)
-        st.markdown("### Secrets format")
-        st.code("""# .streamlit/secrets.toml
-COMPANIES_HOUSE_API_KEYS = [
-  "key_1",
-  "key_2",
-  "key_3"
-]""", language="toml")
 
-    if reset_btn:
-        reset_storage()
-        st.success("Reviewed history and saved results have been cleared.")
+def search_new_companies(client: CHClient, target_date: str, sic_codes: List[str]) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    start_index = 0
+    size = 100
+    type_candidates = get_company_type_candidates()
+    for company_type in type_candidates:
+        while True:
+            params = {
+                "incorporated_from": target_date,
+                "incorporated_to": target_date,
+                "company_status": "active",
+                "company_type": company_type,
+                "sic_codes": ",".join(sic_codes),
+                "size": size,
+                "start_index": start_index,
+            }
+            payload = client.get("/advanced-search/companies", params=params)
+            batch = payload.get("items", []) or []
+            items.extend(batch)
+            total = int(payload.get("total_results", 0) or 0)
+            start_index += size
+            if start_index >= total or not batch:
+                break
+        start_index = 0
+    deduped = {}
+    for item in items:
+        company_number = item.get("company_number")
+        if company_number:
+            deduped[company_number] = item
+    return list(deduped.values())
 
-    api_keys = load_api_keys()
-    if not api_keys:
-        st.error("No API keys found. Add COMPANIES_HOUSE_API_KEYS to .streamlit/secrets.toml before running the app.")
+
+def get_officers(client: CHClient, company_number: str) -> List[Dict[str, Any]]:
+    payload = client.get(f"/company/{company_number}/officers")
+    return payload.get("items", []) or []
+
+
+def get_pscs(client: CHClient, company_number: str) -> List[Dict[str, Any]]:
+    payload = client.get(f"/company/{company_number}/persons-with-significant-control")
+    return payload.get("items", []) or []
+
+
+def has_international_director(client: CHClient, company_number: str) -> bool:
+    officers = get_officers(client, company_number)
+    for officer in officers:
+        role = normalize_text(officer.get("officer_role"))
+        if "director" not in role and role != "designated member":
+            continue
+        nationality = officer.get("nationality")
+        residence = officer.get("country_of_residence")
+        address_country = ((officer.get("address") or {}).get("country"))
+        if (
+            matches_country_or_nationality(nationality, NATIONALITY_TERMS)
+            or matches_country_or_nationality(residence, COUNTRY_TERMS)
+            or matches_country_or_nationality(address_country, COUNTRY_TERMS)
+        ):
+            return True
+    return False
+
+
+def analyse_psc_flags(client: CHClient, company_number: str) -> Tuple[bool, bool]:
+    international_shareholder = False
+    owned_by_company = False
+    pscs = get_pscs(client, company_number)
+    for psc in pscs:
+        kind = psc.get("kind", "")
+        n = psc.get("nationality")
+        country = psc.get("country_of_residence")
+        address_country = ((psc.get("address") or {}).get("country"))
+        if (
+            matches_country_or_nationality(n, NATIONALITY_TERMS)
+            or matches_country_or_nationality(country, COUNTRY_TERMS)
+            or matches_country_or_nationality(address_country, COUNTRY_TERMS)
+        ):
+            international_shareholder = True
+        if kind in COMPANY_OWNER_KINDS or psc.get("name"):
+            if "corporate" in kind or "legal-person" in kind:
+                owned_by_company = True
+    return international_shareholder, owned_by_company
+
+
+def parse_matching_sic(item: Dict[str, Any]) -> str:
+    sic_codes = item.get("sic_codes") or item.get("sic_codes") or []
+    matched = [str(code) for code in sic_codes if str(code) in ALLOWED_SIC_CODES]
+    if not matched and sic_codes:
+        matched = [str(sic_codes[0])]
+    return ", ".join(matched)
+
+
+def process_company(client: CHClient, item: Dict[str, Any], target_date: str) -> Dict[str, Any]:
+    company_number = item.get("company_number", "")
+    name = item.get("company_name") or item.get("title") or ""
+    international_director = has_international_director(client, company_number)
+    international_shareholder, owned_by_company = analyse_psc_flags(client, company_number)
+    return {
+        "company_number": company_number,
+        "company_name": name,
+        "sic_code": parse_matching_sic(item),
+        "incorporation_date": target_date,
+        "company_type": item.get("company_type", ""),
+        "international_director": international_director,
+        "international_shareholder": international_shareholder,
+        "owned_by_company": owned_by_company,
+        "pulled_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "raw_json": item,
+    }
+
+
+def validate_api_keys() -> List[str]:
+    if "COMPANIES_HOUSE_API_KEYS" not in st.secrets:
+        raise ValueError(
+            "Missing COMPANIES_HOUSE_API_KEYS in .streamlit/secrets.toml. "
+            "Expected a TOML list named COMPANIES_HOUSE_API_KEYS."
+        )
+    keys = list(st.secrets["COMPANIES_HOUSE_API_KEYS"])
+    cleaned = [str(k).strip() for k in keys if str(k).strip()]
+    if not cleaned:
+        raise ValueError("COMPANIES_HOUSE_API_KEYS is empty.")
+    return cleaned
+
+
+def main():
+    st.title("Companies House New Incorporations Screener")
+    st.caption("Searches new active incorporations by date, SIC code and company type, then enriches each result with officer and PSC checks.")
+
+    with st.expander("Secrets format", expanded=False):
+        st.code(
+            'COMPANIES_HOUSE_API_KEYS = [\n  "key-1",\n  "key-2",\n  "key-3"\n]',
+            language="toml",
+        )
+
+    try:
+        api_keys = validate_api_keys()
+    except Exception as exc:
+        st.error(str(exc))
         st.stop()
 
-    st.info(f"Loaded {len(api_keys)} Companies House API key(s).")
+    conn = init_db()
+    client = CHClient(api_keys)
 
-    display_all = build_display_all()
-    reviewed = load_reviewed()
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Reviewed companies", len(reviewed))
-    col2.metric("Stored results", len(display_all))
-    col3.metric("Target SIC codes", len(TARGET_SIC_CODES))
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        target_date = st.date_input("Incorporation date", value=date.today(), format="YYYY-MM-DD")
+    with col2:
+        run = st.button("Pull new companies", type="primary", use_container_width=True)
 
-    if run_scan:
-        try:
-            client = CompaniesHouseClient(api_keys)
-            progress_bar = st.progress(0, text="Waiting to start...")
-            status_box = st.empty()
-            with st.spinner("Searching and screening new companies..."):
-                new_df, raw_count, candidate_count, display_all = screen_new_companies(
-                    client,
-                    target_date.isoformat(),
-                    progress_bar=progress_bar,
-                    status_box=status_box,
-                )
-            st.success(f"Scan complete. Found {raw_count} raw companies, {candidate_count} new candidates, {len(new_df)} newly screened rows.")
-            st.subheader("New companies from this scan")
-            st.dataframe(new_df, use_container_width=True, hide_index=True)
-        except Exception as exc:
-            st.exception(exc)
+    date_str = target_date.strftime("%Y-%m-%d")
+    st.write(f"Using {len(api_keys)} API key(s). Allowed SIC codes loaded: {len(ALLOWED_SIC_CODES)}")
 
-    st.subheader("All screened companies")
-    st.dataframe(display_all, use_container_width=True, hide_index=True)
+    if run:
+        with st.status("Pulling companies and enriching results...", expanded=True) as status:
+            st.write("Searching Companies House advanced search endpoint...")
+            companies = search_new_companies(client, date_str, ALLOWED_SIC_CODES)
+            already_seen = existing_company_numbers(conn, date_str)
+            new_companies = [c for c in companies if c.get("company_number") not in already_seen]
+            st.write(f"Found {len(companies)} matching companies, {len(new_companies)} new to process.")
+
+            progress = st.progress(0)
+            total = max(len(new_companies), 1)
+            processed = 0
+            for item in new_companies:
+                try:
+                    row = process_company(client, item, date_str)
+                    upsert_company(conn, row)
+                except Exception as exc:
+                    st.warning(f"Skipped {item.get('company_number', 'unknown')} due to error: {exc}")
+                processed += 1
+                progress.progress(min(processed / total, 1.0))
+            status.update(label="Refresh complete", state="complete")
+
+    result_df = read_results(conn, date_str)
+    st.subheader("Results")
+    st.dataframe(result_df, use_container_width=True, hide_index=True)
+
+    export_df = result_df.copy()
+    csv = export_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download CSV",
+        data=csv,
+        file_name=f"companies_house_screening_{date_str}.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+    st.subheader("Rules applied")
+    st.markdown(
+        """
+- Company status: Active
+- SIC codes: predefined allow-list of 20 codes
+- Company types searched: Private Limited Company variants and LLP
+- International Director?: ticks when director/designated member nationality, country of residence or address country matches target countries
+- International Shareholder?: ticks when PSC nationality, residence or address country matches target countries/nationalities
+- Owned By A Company?: ticks when a PSC record indicates a corporate or legal-person owner
+- Refresh logic: already-screened company numbers for the selected incorporation date are skipped on future refreshes
+        """
+    )
 
 
 if __name__ == "__main__":
