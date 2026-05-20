@@ -269,7 +269,7 @@ def get_psc_flags(client: CompaniesHouseClient, company_number: str) -> Tuple[bo
         time.sleep(0.05)
 
 
-def screen_new_companies(client: CompaniesHouseClient, target_date: str):
+def screen_new_companies(client: CompaniesHouseClient, target_date: str, progress_bar=None, status_box=None):
     reviewed = load_reviewed()
     results_df = load_results()
     raw_companies = fetch_companies_for_date(client, target_date)
@@ -289,11 +289,21 @@ def screen_new_companies(client: CompaniesHouseClient, target_date: str):
         candidates.append(item)
 
     new_rows = []
-    for item in candidates:
+    total_candidates = len(candidates)
+    if progress_bar is not None:
+        progress_bar.progress(0, text=f"Starting screening for {total_candidates} company(ies)...")
+    if status_box is not None:
+        status_box.info(f"Preparing to screen {total_candidates} new company(ies).")
+
+    for idx, item in enumerate(candidates, start=1):
         company_number = str(item.get("company_number", "")).strip()
         company_name = item.get("company_name") or item.get("title") or ""
         sic_code = extract_target_sic(item)
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        if status_box is not None:
+            status_box.info(f"Screening {idx}/{total_candidates}: {company_name} ({company_number})")
+
         director_flag = has_international_director(client, company_number)
         shareholder_flag, company_owner_flag = get_psc_flags(client, company_number)
         row = {
@@ -309,6 +319,9 @@ def screen_new_companies(client: CompaniesHouseClient, target_date: str):
         new_rows.append(row)
         reviewed[company_number] = {"search_date": target_date, "screened_at": ts}
 
+        if progress_bar is not None and total_candidates > 0:
+            progress_bar.progress(idx / total_candidates, text=f"Processed {idx} of {total_candidates} companies")
+
     save_reviewed(reviewed)
 
     if new_rows:
@@ -322,7 +335,19 @@ def screen_new_companies(client: CompaniesHouseClient, target_date: str):
             "international_director", "international_shareholder", "owned_by_a_company"
         ])
 
-    display_new = new_df[[
+    filtered_new_df = new_df[
+        (new_df["international_director"] == "✓") |
+        (new_df["international_shareholder"] == "✓") |
+        (new_df["owned_by_a_company"] == "✓")
+    ].copy()
+
+    filtered_all_df = results_df[
+        (results_df["international_director"] == "✓") |
+        (results_df["international_shareholder"] == "✓") |
+        (results_df["owned_by_a_company"] == "✓")
+    ].copy()
+
+    display_new = filtered_new_df[[
         "company_name", "sic_code", "international_director", "international_shareholder", "owned_by_a_company"
     ]].rename(columns={
         "company_name": "Company Name",
@@ -332,7 +357,7 @@ def screen_new_companies(client: CompaniesHouseClient, target_date: str):
         "owned_by_a_company": "Owned By A Company?",
     })
 
-    display_all = results_df[[
+    display_all = filtered_all_df[[
         "company_name", "sic_code", "international_director", "international_shareholder", "owned_by_a_company", "screened_at"
     ]].rename(columns={
         "company_name": "Company Name",
@@ -342,6 +367,10 @@ def screen_new_companies(client: CompaniesHouseClient, target_date: str):
         "owned_by_a_company": "Owned By A Company?",
         "screened_at": "Pulled At",
     })
+    if progress_bar is not None:
+        progress_bar.progress(1.0, text="Screening complete")
+    if status_box is not None:
+        status_box.success(f"Finished screening {len(candidates)} new company(ies).")
     return display_new, len(raw_companies), len(candidates), display_all
 
 
@@ -360,7 +389,12 @@ def build_display_all() -> pd.DataFrame:
             "Company Name", "SIC Code", "International Director?", "International Shareholder?",
             "Owned By A Company?", "Pulled At"
         ])
-    return all_results_df[[
+    filtered_all_df = all_results_df[
+        (all_results_df["international_director"] == "✓") |
+        (all_results_df["international_shareholder"] == "✓") |
+        (all_results_df["owned_by_a_company"] == "✓")
+    ].copy()
+    return filtered_all_df[[
         "company_name", "sic_code", "international_director", "international_shareholder", "owned_by_a_company", "screened_at"
     ]].rename(columns={
         "company_name": "Company Name",
@@ -411,8 +445,15 @@ COMPANIES_HOUSE_API_KEYS = [
     if run_scan:
         try:
             client = CompaniesHouseClient(api_keys)
+            progress_bar = st.progress(0, text="Waiting to start...")
+            status_box = st.empty()
             with st.spinner("Searching and screening new companies..."):
-                new_df, raw_count, candidate_count, display_all = screen_new_companies(client, target_date.isoformat())
+                new_df, raw_count, candidate_count, display_all = screen_new_companies(
+                    client,
+                    target_date.isoformat(),
+                    progress_bar=progress_bar,
+                    status_box=status_box,
+                )
             st.success(f"Scan complete. Found {raw_count} raw companies, {candidate_count} new candidates, {len(new_df)} newly screened rows.")
             st.subheader("New companies from this scan")
             st.dataframe(new_df, use_container_width=True, hide_index=True)
